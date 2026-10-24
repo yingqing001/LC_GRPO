@@ -99,7 +99,7 @@ TASK=hps bash scripts/multi_node/sd3_lc_grpo.sh 0
 TASK=hps bash scripts/multi_node/sd3_lc_grpo.sh 1
 ```
 
-## 🙏 Acknowledgement
+## 🙏 Acknowledgements
 
 This repository is built upon [Flow-GRPO](https://github.com/yifan123/flow_grpo), which is based on [ddpo-pytorch](https://github.com/kvablack/ddpo-pytorch) and [diffusers](https://github.com/huggingface/diffusers). We thank the Flow-GRPO authors for open-sourcing their excellent work and all the authors of these projects for their valuable contributions.
 

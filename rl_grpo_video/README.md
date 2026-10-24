@@ -86,7 +86,7 @@ Training checkpoints, sampled videos, reward traces, and logs are written under
 `outputs_res/<run-name>`. Weights & Biases logging is enabled by default; set
 `WANDB_MODE=offline` in the launcher if online logging is not desired.
 
-## Acknowledgements
+## 🙏 Acknowledgements
 
 This codebase is built upon
 [DanceGRPO](https://github.com/XueZeyue/DanceGRPO),
@@ -95,7 +95,7 @@ This codebase is built upon
 [DDPO-PyTorch](https://github.com/kvablack/ddpo-pytorch). We thank the authors
 for releasing their work.
 
-## Citation
+## 📚 Citation
 
 If LC-GRPO helps your work, please cite:
 

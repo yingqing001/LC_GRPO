@@ -15,7 +15,7 @@
 </div>
 
 
-## Introduction
+## 📖 Introduction
 
 Applying reinforcement learning to flow models creates a fundamental conflict:
 
@@ -56,7 +56,7 @@ FLUX.1-Dev. See the [image-generation README](image_gen/README.md) for details.
 We conduct video-generation experiments on HunyuanVideo. See the
 [video-generation README](rl_grpo_video/README.md) for details.
 
-## Citation
+## 📚 Citation
 
 If LC-GRPO helps your work, please cite:
 
