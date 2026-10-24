@@ -1,0 +1,80 @@
+# Local agent and cloud configuration
+/.agents/
+/.aws/
+/.codex/
+.claude/
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.yaml
+*.key
+*.pem
+*.p12
+*.pfx
+.netrc
+.npmrc
+.pypirc
+
+# Python caches, environments, and build products
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+/tmp*/
+
+# Experiment tracking and generated training artifacts
+wandb/
+logs/
+slurm_logs/
+output/
+outputs/
+output_log/
+outputs_res/
+outputs_res_vbench/
+checkpoint/
+checkpoints/
+videos/
+*.mp4
+
+# Downloaded models and datasets
+data/
+pretrained/
+Qwen2-VL-2B-Instruct/
+videoalign_ckpt/
+hps_ckpt/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# This small scorer is an intentional source asset.
+!image_gen/flow_grpo/assets/sac+logos+ava1-l14-linearMSE.pth
+
+# Local project notes (may contain infrastructure details)
+memory/

@@ -1,0 +1,42 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# ---- Model checkpoints & datasets (large, downloaded) ----
+data/
+Qwen2-VL-2B-Instruct/
+videoalign_ckpt/
+hps_ckpt/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# ---- Training outputs / artifacts ----
+outputs/
+output_log/
+videos/
+wandb/
+*.mp4
+outputs_res/
+outputs_res_vbench/
+
+# ---- Reward logs ----
+vq_reward.txt
+mq_reward.txt
+ta_reward.txt
+reward.txt
+hps_reward.txt
+
+# ---- Misc / caches ----
+.cache/
+*.log
+.DS_Store

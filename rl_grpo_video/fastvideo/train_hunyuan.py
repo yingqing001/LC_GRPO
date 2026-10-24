@@ -1,0 +1,1303 @@
+import argparse
+from email.policy import strict
+import math
+import os
+from pathlib import Path
+from fastvideo.utils.parallel_states import (
+    initialize_sequence_parallel_state,
+    destroy_sequence_parallel_group,
+    get_sequence_parallel_state,
+    nccl_info,
+)
+from fastvideo.utils.communications import sp_parallel_dataloader_wrapper, broadcast
+from fastvideo.utils.validation import log_validation
+import time
+from torch.utils.data import DataLoader
+import torch
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
+)
+from torch.utils.data.distributed import DistributedSampler
+from fastvideo.utils.dataset_utils import LengthGroupedSampler
+import wandb
+from accelerate.utils import set_seed
+from tqdm.auto import tqdm
+from fastvideo.utils.fsdp_util import get_dit_fsdp_kwargs, apply_fsdp_checkpointing
+from fastvideo.utils.load import load_transformer
+from diffusers.optimization import get_scheduler
+from fastvideo.models.mochi_hf.modeling_mochi import MochiTransformer3DModel
+from diffusers.utils import check_min_version
+from fastvideo.dataset.latent_rl_datasets import LatentDataset, latent_collate_function
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from fastvideo.utils.checkpoint import (
+    save_checkpoint,
+    save_lora_checkpoint,
+    resume_lora_optimizer,
+)
+from fastvideo.utils.logging_ import main_print
+from fastvideo.models.mochi_hf.pipeline_mochi import MochiPipeline
+import cv2
+from diffusers.video_processor import VideoProcessor
+from fastvideo.utils.load import load_vae
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+check_min_version("0.31.0")
+import time
+from collections import deque
+from torch.nn import functional as F
+from typing import List
+from fastvideo.models.hunyuan_hf.pipeline_hunyuan import HunyuanVideoPipeline
+
+
+def sd3_time_shift(shift, t):
+    return (shift * t) / (1 + (shift - 1) * t)
+
+def flux_step(
+    model_output: torch.Tensor,
+    latents: torch.Tensor,
+    eta: float,
+    sigmas: torch.Tensor,
+    index: int,
+    prev_sample: torch.Tensor,
+    grpo: bool,
+    sde_solver: bool,
+    sde_type: str = "sde",
+):
+    # `index` is a scalar for sampling / micro-batch==1 (original path, unchanged).
+    # For training with train_micro_batch_size>1 it is a 1-D (B,) tensor of per-sample
+    # sigma indices, so we gather per-sample sigmas and broadcast over the latent dims.
+    if torch.is_tensor(index) and index.ndim == 1:
+        sigmas = sigmas.to(index.device)
+        view = (-1,) + (1,) * (latents.ndim - 1)
+        sigma = sigmas[index].view(view).to(latents.dtype)
+        sigma_next = sigmas[index + 1].view(view).to(latents.dtype)
+        dsigma = sigma_next - sigma
+        delta_t = sigma - sigma_next
+        std_dev_t = eta * torch.sqrt(delta_t)
+        log_std_dev_t = torch.log(std_dev_t)
+    else:
+        sigma = sigmas[index]
+        sigma_next = sigmas[index + 1]
+        dsigma = sigma_next - sigma
+        delta_t = sigma - sigma_next
+        std_dev_t = eta * math.sqrt(delta_t)
+        log_std_dev_t = math.log(std_dev_t)
+
+    prev_sample_mean = latents + dsigma * model_output
+
+    pred_original_sample = latents - sigma * model_output
+
+    if sde_solver:
+
+        if sde_type == "sde":
+
+            score_estimate = -(latents-pred_original_sample*(1 - sigma))/sigma**2
+            log_term = -0.5 * eta**2 * score_estimate
+            prev_sample_mean = prev_sample_mean + log_term * dsigma
+
+        elif sde_type == "cps":
+
+            noise_estimate = latents + model_output * (1 - sigma) # predicted x_1 in paper
+
+            # Use the already-broadcast next-step sigma so the micro-batch
+            # (per-sample tensor `index`) path works as well as the scalar path.
+            sigma_prev = sigma_next
+            # sigma_t in paper: noise std injected this step. eta in [0, 1] maps
+            # to a fraction of the full sigma_prev via sin(eta * pi / 2).
+            std_dev_t = sigma_prev * math.sin(eta * math.pi / 2)
+            # `std_dev_t` was overwritten, so the log term used by the GRPO
+            # log-prob below must be recomputed from the cps std, not the sde one.
+            log_std_dev_t = torch.log(std_dev_t) if torch.is_tensor(std_dev_t) else math.log(std_dev_t)
+
+            prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * torch.sqrt(sigma_prev**2 - std_dev_t**2)
+
+
+        else:
+            raise ValueError(f"Unsupported sde_type: {sde_type}")
+
+    if grpo and prev_sample is None:
+        prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
+
+
+    if grpo:
+        # log prob of prev_sample given prev_sample_mean and std_dev_t
+
+        if sde_type == "sde":
+            log_prob = ((
+                -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2) / (2 * (std_dev_t**2))
+            )
+            - log_std_dev_t - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi))))
+
+        elif sde_type == "cps":
+             # remove all constants
+            log_prob = -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2)
+
+
+        # mean along all but batch dimension
+        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        return prev_sample, pred_original_sample, log_prob
+    else:
+        return prev_sample_mean,pred_original_sample
+
+
+
+def assert_eq(x, y, msg=None):
+    assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
+
+
+def run_sample_step(
+        args,
+        z,
+        sigma_schedule,
+        transformer,
+        encoder_hidden_states,
+        encoder_attention_mask,
+    ):
+    all_latents = [z]
+    all_log_probs = []
+
+    rank = int(os.environ["RANK"])
+    progress_bar = tqdm(range(0, len(sigma_schedule) - 1), desc="Sampling", leave=False, disable=(rank != 0))
+
+    for i in progress_bar:  # Add progress bar
+        B = encoder_hidden_states.shape[0]
+        sigma = sigma_schedule[i]
+        timestep_value = int(sigma * 1000)
+        timesteps = torch.full([encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
+        transformer.eval()
+        with torch.autocast("cuda", torch.bfloat16):
+            model_pred= transformer(
+                hidden_states=z,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timesteps,
+                guidance=torch.tensor(
+                    [6018.0],
+                    device=z.device,
+                    dtype=torch.bfloat16
+                ),
+                encoder_attention_mask=encoder_attention_mask,  # B, L
+                return_dict=False,
+            )[0]
+        z, pred_original, log_prob = flux_step(model_pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=True, sde_type=args.sde_type)
+        z = z.to(torch.bfloat16)
+        all_latents.append(z)
+        all_log_probs.append(log_prob)
+    latents = pred_original.to(torch.float32)/0.476986
+    all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
+    all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
+    return z, latents, all_latents, all_log_probs
+
+        
+def grpo_one_step(
+            args,
+            latents,
+            pre_latents,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            transformer,
+            timesteps,
+            i,
+            sigma_schedule,
+):
+    B = encoder_hidden_states.shape[0]
+    with torch.autocast("cuda", torch.bfloat16):
+        transformer.train()
+        model_pred= transformer(
+            hidden_states=latents,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timesteps,
+            guidance=torch.tensor(
+                [6018.0],
+                device=latents.device,
+                dtype=torch.bfloat16
+            ),
+            encoder_attention_mask=encoder_attention_mask,  # B, L
+            return_dict=False,
+        )[0]
+    z, pred_original, log_prob = flux_step(model_pred, latents.to(torch.float32), args.eta, sigma_schedule, i, prev_sample=pre_latents.to(torch.float32), grpo=True, sde_solver=True, sde_type=args.sde_type)
+    return log_prob
+
+def sample_reference_model(
+    args,
+    step,
+    device, 
+    transformer,
+    vae,
+    encoder_hidden_states, 
+    encoder_attention_mask,
+    inferencer,
+    caption,
+):
+    w, h, t = args.w, args.h, args.t
+    sample_steps = args.sampling_steps
+    sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1)
+    
+    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
+
+    assert_eq(
+        len(sigma_schedule),
+        sample_steps + 1,
+        "sigma_schedule must have length sample_steps + 1",
+    )
+
+    B = encoder_hidden_states.shape[0]
+    SPATIAL_DOWNSAMPLE = 8
+    TEMPORAL_DOWNSAMPLE = 4
+    IN_CHANNELS = 16
+    latent_t = ((t - 1) // TEMPORAL_DOWNSAMPLE) + 1
+    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
+
+    
+    sample_batch_size = args.sample_batch_size
+    assert B % sample_batch_size == 0, \
+        f"B ({B}) must be divisible by sample_batch_size ({sample_batch_size})"
+    batch_indices = torch.chunk(torch.arange(B), B // sample_batch_size)
+
+    all_latents = []
+    all_log_probs = []
+    all_vq_rewards = []
+    all_mq_rewards = []
+    all_ta_rewards = []
+    if args.use_same_noise:
+        input_latents = torch.randn(
+                (1, IN_CHANNELS, latent_t, latent_h, latent_w),  #（c,t,h,w)
+                device=device,
+                dtype=torch.bfloat16,
+            )
+    rank = int(os.environ["RANK"])
+    # total rollout progress bar over all videos generated this step (rank 0 only)
+    rollout_bar = tqdm(total=B, desc=f"Rollout (step {step})", disable=(rank != 0))
+    for index, batch_idx in enumerate(batch_indices):
+        cur_bs = len(batch_idx)
+        batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
+        batch_encoder_attention_mask = encoder_attention_mask[batch_idx]
+        batch_caption = [caption[i] for i in batch_idx]
+        if args.use_same_noise:
+            # whole rollout shares one init noise; replicate it across the micro-batch
+            # (the SDE sampler still diverges the rows via independent per-step noise).
+            cur_latents = input_latents.repeat(cur_bs, 1, 1, 1, 1)
+        else:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(42)
+            cur_latents = torch.randn(
+                (cur_bs, IN_CHANNELS, latent_t, latent_h, latent_w),  #（c,t,h,w)
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        # grpo_sample=True
+        # progress_bar = tqdm(range(0, sample_steps), desc="Sampling", leave=False, disable=(rank != 0))
+        with torch.no_grad():
+            z, latents, batch_latents, batch_log_probs = run_sample_step(
+                args,
+                cur_latents.clone(),
+                sigma_schedule,
+                transformer,
+                batch_encoder_hidden_states,
+                batch_encoder_attention_mask,
+                grpo_sample=True,
+            )
+        
+        # 累积所有批次的latents和log_probs
+        all_latents.append(batch_latents)
+        all_log_probs.append(batch_log_probs)
+        vae.enable_tiling()
+        
+        video_processor = VideoProcessor(
+            vae_scale_factor=8)
+        
+        # Decode in small batch chunks: the HunyuanVideo VAE tiles spatially/temporally
+        # but NOT over the batch dim, so a large batched decode overflows
+        # upsample_nearest3d's INT_MAX (32-bit) indexing. Chunking keeps it safe while
+        # the (expensive) denoising stays fully batched.
+        videos = []
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                for c in range(0, latents.shape[0], args.decode_batch_size):
+                    chunk = vae.decode(latents[c:c + args.decode_batch_size], return_dict=False)[0]
+                    videos.extend(video_processor.postprocess_video(chunk))
+        rank = int(os.environ["RANK"])
+        from diffusers.utils import export_to_video
+
+        # write sampled videos under this run's output_dir so concurrent runs
+        # (different settings) don't clobber each other's scratch files / rewards.
+        video_dir = os.path.join(args.output_dir, "videos", f"step{step}")
+        os.makedirs(video_dir, exist_ok=True)
+        # export + score each video in the micro-batch; order is preserved == batch_idx
+        # order, so all_*_rewards stays aligned with all_latents/all_log_probs.
+        for b in range(cur_bs):
+            global_idx = index * sample_batch_size + b
+            video_path = os.path.join(video_dir, f"hunyuan_{rank}_{global_idx}.mp4")
+            export_to_video(videos[b], video_path, fps=args.fps)
+            if args.use_videoalign:
+                try:
+                    with torch.no_grad():
+                        absolute_path = os.path.abspath(video_path)
+                        #print("starting video align")
+                        reward = inferencer.reward(
+                            [absolute_path],
+                            [batch_caption[b]],
+                            use_norm=True,
+                        )
+                        vq_reward = torch.tensor(reward[0]['VQ']).to(device)
+                        all_vq_rewards.append(vq_reward.unsqueeze(0))
+                        mq_reward = torch.tensor(reward[0]['MQ']).to(device)
+                        all_mq_rewards.append(mq_reward.unsqueeze(0))
+                        ta_reward = torch.tensor(reward[0]['TA']).to(device)
+                        all_ta_rewards.append(ta_reward.unsqueeze(0))
+                except Exception as e:
+                    vq_reward = torch.tensor(-1.0).to(device)
+                    all_vq_rewards.append(vq_reward.unsqueeze(0))
+                    mq_reward = torch.tensor(-1.0).to(device)
+                    all_mq_rewards.append(mq_reward.unsqueeze(0))
+                    ta_reward = torch.tensor(-1.0).to(device)
+                    all_ta_rewards.append(ta_reward.unsqueeze(0))
+        rollout_bar.update(cur_bs)
+    rollout_bar.close()
+
+    all_latents = torch.cat(all_latents, dim=0)
+    all_log_probs = torch.cat(all_log_probs, dim=0)
+    all_vq_rewards = torch.cat(all_vq_rewards, dim=0)
+    all_mq_rewards = torch.cat(all_mq_rewards, dim=0)
+    all_ta_rewards = torch.cat(all_ta_rewards, dim=0)
+
+    return videos, z, all_vq_rewards, all_mq_rewards, all_ta_rewards, all_latents, all_log_probs, sigma_schedule
+
+def gather_tensor(tensor):
+    if not dist.is_initialized():
+        return tensor
+    world_size = dist.get_world_size()
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, tensor)
+    return torch.cat(gathered_tensors, dim=0)
+
+def train_one_step(
+    args,
+    device,
+    transformer,
+    vae,
+    inferencer,
+    optimizer,
+    lr_scheduler,
+    loader,
+    max_grad_norm,
+    step,
+):
+    total_loss = 0.0
+    metrics = {}          # scalars to log to wandb (rewards + PPO diagnostics)
+    ppo_ratios = []       # accumulated importance ratios over the inner loop
+    ppo_deltas = []       # accumulated (new_log_prob - old_log_prob) for approx_kl
+    optimizer.zero_grad()
+    (
+        encoder_hidden_states,
+        encoder_attention_mask,
+        caption,
+    ) = next(loader)
+    if args.use_group:
+        def repeat_tensor(tensor):
+            if tensor is None:
+                return None
+            return torch.repeat_interleave(tensor, args.num_generations, dim=0)
+
+        encoder_hidden_states = repeat_tensor(encoder_hidden_states)
+        encoder_attention_mask = repeat_tensor(encoder_attention_mask)
+
+        if isinstance(caption, str):
+            caption = [caption] * args.num_generations
+        elif isinstance(caption, (list, tuple)):
+            # collate returns a tuple of captions (one per prompt in the batch);
+            # expand each prompt's caption into its num_generations group, contiguously.
+            caption = [item for item in caption for _ in range(args.num_generations)]
+        else:
+            raise ValueError(f"Unsupported caption type: {type(caption)}")
+        
+    videos, latents, vq_reward, mq_reward, ta_reward, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
+            args,
+            step,
+            device, 
+            transformer,
+            vae,
+            encoder_hidden_states, 
+            encoder_attention_mask, 
+            inferencer,
+            caption,
+        )
+    
+    batch_size = all_latents.shape[0]
+    # timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
+    # timestep_values = [timestep_value[:] for _ in range(batch_size)]
+    # device = all_latents.device
+    # timesteps =  torch.tensor(timestep_values, device=all_latents.device, dtype=torch.long)
+
+    timestep_indice = torch.arange(
+        args.sampling_steps,
+        device=all_latents.device,
+        dtype=torch.long
+    )
+
+
+    samples = {
+        "timesteps": timestep_indice.unsqueeze(0).expand(batch_size, -1).detach().clone(),
+        "latents": all_latents[
+            :, :-1
+        ][:, :-1],  # each entry is the latent before timestep t
+        "next_latents": all_latents[
+            :, 1:
+        ][:, :-1],  # each entry is the latent after timestep t
+        "log_probs": all_log_probs[:, :-1],
+        "vq_rewards": vq_reward.to(torch.float32),
+        "mq_rewards": mq_reward.to(torch.float32),
+        "ta_rewards": ta_reward.to(torch.float32),
+        "encoder_hidden_states": encoder_hidden_states,
+        "encoder_attention_mask": encoder_attention_mask,
+    }
+    gathered_vq_reward = gather_tensor(samples["vq_rewards"])
+    gathered_mq_reward = gather_tensor(samples["mq_rewards"])
+    gathered_ta_reward = gather_tensor(samples["ta_rewards"])
+    # global (cross-GPU) reward statistics
+    metrics["vq_reward_mean"] = gathered_vq_reward.mean().item()
+    metrics["vq_reward_std"] = gathered_vq_reward.std().item()
+    metrics["mq_reward_mean"] = gathered_mq_reward.mean().item()
+    metrics["mq_reward_std"] = gathered_mq_reward.std().item()
+    metrics["ta_reward_mean"] = gathered_ta_reward.mean().item()
+    metrics["ta_reward_std"] = gathered_ta_reward.std().item()
+    if dist.get_rank()==0:
+        # write reward logs under this run's output_dir so concurrent runs don't mix curves
+        print("gathered_vq_reward", gathered_vq_reward)
+        with open(os.path.join(args.output_dir, 'vq_reward.txt'), 'a') as f:
+            f.write(f"{gathered_vq_reward.mean().item()}\n")
+        print("gathered_mq_reward", gathered_mq_reward)
+        with open(os.path.join(args.output_dir, 'mq_reward.txt'), 'a') as f:
+            f.write(f"{gathered_mq_reward.mean().item()}\n")
+        print("gathered_ta_reward", gathered_ta_reward)
+        with open(os.path.join(args.output_dir, 'ta_reward.txt'), 'a') as f:
+            f.write(f"{gathered_ta_reward.mean().item()}\n")
+
+    n = len(samples["vq_rewards"]) // (args.num_generations)
+    vq_advantages = torch.zeros_like(samples["vq_rewards"])
+    mq_advantages = torch.zeros_like(samples["mq_rewards"])
+    ta_advantages = torch.zeros_like(samples["ta_rewards"])
+
+    for i in range(n):
+        start_idx = i * args.num_generations
+        end_idx = (i + 1) * args.num_generations
+        group_rewards = samples["vq_rewards"][start_idx:end_idx]
+        group_mean = group_rewards.mean()
+        group_std = group_rewards.std() + 1e-8
+        vq_advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
+    
+    samples["vq_advantages"] = vq_advantages
+
+    for i in range(n):
+        start_idx = i * args.num_generations
+        end_idx = (i + 1) * args.num_generations
+        group_rewards = samples["mq_rewards"][start_idx:end_idx]
+        group_mean = group_rewards.mean()
+        group_std = group_rewards.std() + 1e-8
+        mq_advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
+
+    samples["mq_advantages"] = mq_advantages
+
+    for i in range(n):
+        start_idx = i * args.num_generations
+        end_idx = (i + 1) * args.num_generations
+        group_rewards = samples["ta_rewards"][start_idx:end_idx]
+        group_mean = group_rewards.mean()
+        group_std = group_rewards.std() + 1e-8
+        ta_advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
+
+    samples["ta_advantages"] = ta_advantages
+
+    # best-of-n (per group): select top/bottom bestofn//2 *within each group*
+    # so that each prompt contributes its own bestofn samples to the update,
+    # rather than the selection being pooled across groups on the same GPU.
+    total_scores = args.vq_coef * samples["vq_advantages"] + args.mq_coef * samples["mq_advantages"] + args.ta_coef * samples["ta_advantages"]
+
+    if args.num_generations != args.bestofn:
+        selected_indices_list = []
+        for i in range(n):
+            start_idx = i * args.num_generations
+            end_idx = (i + 1) * args.num_generations
+            # argsort within the group, then offset back to global indices
+            group_sorted = torch.argsort(total_scores[start_idx:end_idx]) + start_idx
+            top_indices = group_sorted[-args.bestofn//2:]
+            bottom_indices = group_sorted[:args.bestofn//2]
+            selected_indices_list.append(torch.cat([top_indices, bottom_indices]))
+        selected_indices = torch.cat(selected_indices_list)
+        shuffled_order = torch.randperm(len(selected_indices), device=selected_indices.device)
+        selected_indices = selected_indices[shuffled_order]
+
+        for key in samples:
+            samples[key] = samples[key][selected_indices]
+        batch_size = len(selected_indices)
+
+    ##### prepare for training ######
+
+    total_batch_size, num_timesteps = samples["timesteps"].shape
+
+    assert num_timesteps == args.sampling_steps
+
+    perm = torch.randperm(total_batch_size, device=device)
+    samples = {k: v[perm] for k, v in samples.items()}
+
+    m = args.train_micro_batch_size
+    assert batch_size % m == 0, \
+        f"selected samples ({batch_size}) must be divisible by train_micro_batch_size ({m})"
+    assert args.gradient_accumulation_steps % m == 0, \
+        f"gradient_accumulation_steps ({args.gradient_accumulation_steps}) must be divisible by train_micro_batch_size ({m})"
+    
+    num_micro = batch_size // m
+    accum_micro = args.gradient_accumulation_steps // m
+
+    # rebatch for training
+    samples_batched = {
+        k: v.reshape(-1, args.train_micro_batch_size, *v.shape[1:])
+        for k, v in samples.items()
+    }
+
+    # dict of lists -> list of dicts for easier iteration
+    samples_batched = [
+        dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+    ]
+
+
+    num_train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
+    
+    ### yingqing: resume here
+       
+    perms = torch.stack(
+        [
+            torch.randperm(len(samples["timesteps"][0]))
+            for _ in range(batch_size)
+        ]
+    ).to(device) 
+    
+    for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+        samples[key] = samples[key][
+            torch.arange(batch_size).to(device) [:, None],
+            perms,
+        ]
+    train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
+    # ---- training micro-batch (Option B): batch `m` samples per forward/backward ----
+    # Identical optimizer update to the per-sample path (modulo FP): each sample keeps
+    # its own permuted timesteps via a per-sample sigma index, the loss is mean-over-m
+    # divided by (grad_accum//m * train_timesteps), and we step every grad_accum//m
+    # micro-batches -> same effective batch and same number of updates per rollout.
+    num_micro = batch_size // m
+    accum_micro = args.gradient_accumulation_steps // m
+    # reshape selected samples into `num_micro` micro-batches of `m` consecutive samples
+    samples_batched = {
+        k: v.reshape(num_micro, m, *v.shape[1:]) for k, v in samples.items()
+    }
+    samples_batched = [
+        dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+    ]
+    perms_batched = perms.reshape(num_micro, m, -1)   # (num_micro, m, num_timesteps)
+    # total training progress bar over all forward+backward passes this step (rank 0)
+    train_bar = tqdm(total=num_micro * train_timesteps, desc=f"Train (step {step})", disable=(dist.get_rank() != 0))
+    last_ratio_idx = 0    # start of the current grad-update's ratio window in ppo_ratios
+    update_count = 0      # number of optimizer.step()s so far this rollout
+    for mb, sample in enumerate(samples_batched):
+        perm_mb = perms_batched[mb]              # (m, num_timesteps)
+        for _ in range(train_timesteps):
+            clip_range = 1e-4
+            adv_clip_max = 5.0
+            # per-sample sigma index for this inner step; scalar when m==1 so the
+            # original (sampling-style) flux_step path is used unchanged.
+            idx = perm_mb[:, _] if m > 1 else perm_mb[0, _]
+            new_log_probs = grpo_one_step(
+                args,
+                sample["latents"][:, _],
+                sample["next_latents"][:, _],
+                sample["encoder_hidden_states"],
+                sample["encoder_attention_mask"],
+                transformer,
+                sample["timesteps"][:, _],
+                idx,
+                sigma_schedule,
+            )
+            ratio = torch.exp(new_log_probs - sample["log_probs"][:, _])
+
+            # accumulate PPO health diagnostics (rank-local, detached)
+            ppo_ratios.append(ratio.detach().flatten())
+            ppo_deltas.append((new_log_probs - sample["log_probs"][:, _]).detach().flatten())
+
+            vq_advantages = torch.clamp(
+                sample["vq_advantages"],
+                -adv_clip_max,
+                adv_clip_max,
+            )
+            vq_unclipped_loss = -vq_advantages * ratio
+            vq_clipped_loss = -vq_advantages * torch.clamp(
+                ratio,
+                1.0 - clip_range,
+                1.0 + clip_range,
+            )
+            vq_loss = torch.mean(torch.maximum(vq_unclipped_loss, vq_clipped_loss)) / (accum_micro * train_timesteps)
+      
+
+            mq_advantages = torch.clamp(
+                sample["mq_advantages"],
+                -adv_clip_max,
+                adv_clip_max,
+            )
+            mq_unclipped_loss = -mq_advantages * ratio
+            mq_clipped_loss = -mq_advantages * torch.clamp(
+                ratio,
+                1.0 - clip_range,
+                1.0 + clip_range,
+            )
+            mq_loss = torch.mean(torch.maximum(mq_unclipped_loss, mq_clipped_loss)) / (accum_micro * train_timesteps)
+
+            ta_advantages = torch.clamp(
+                sample["ta_advantages"],
+                -adv_clip_max,
+                adv_clip_max,
+            )
+            ta_unclipped_loss = -ta_advantages * ratio
+            ta_clipped_loss = -ta_advantages * torch.clamp(
+                ratio,
+                1.0 - clip_range,
+                1.0 + clip_range,
+            )
+            ta_loss = torch.mean(torch.maximum(ta_unclipped_loss, ta_clipped_loss)) / (accum_micro * train_timesteps)
+
+            final_loss = args.vq_coef*vq_loss + args.mq_coef*mq_loss + args.ta_coef*ta_loss
+            
+            final_loss.backward()
+            avg_loss = final_loss.detach().clone()
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+            total_loss += avg_loss.item()
+            train_bar.update(1)
+        if (mb+1)%accum_micro==0:
+            grad_norm = transformer.clip_grad_norm_(max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            # DEBUG: per-update PPO ratio stats (this grad update's accumulation window)
+            update_count += 1
+            window = torch.cat(ppo_ratios[last_ratio_idx:]).float()
+            if dist.get_rank() == 0:
+                print(
+                    f"[DEBUG] step {step} update {update_count} "
+                    f"ratio max={window.max().item():.6f} "
+                    f"min={window.min().item():.6f} mean={window.mean().item():.6f} "
+                    f"std={window.std().item():.6f}"
+                )
+            last_ratio_idx = len(ppo_ratios)
+        if dist.get_rank()%8==0:
+            print("vq loss/mq loss/ta loss", vq_loss.item(), mq_loss.item(), ta_loss.item())
+            print("vq/mq/ta reward", sample["vq_rewards"].mean().item(), sample["mq_rewards"].mean().item(), sample["ta_rewards"].mean().item())
+            print(" ratio", ratio)
+            print("vq advantage/mq advantage/ta advantage", vq_advantages.mean().item(), mq_advantages.mean().item(), ta_advantages.mean().item())
+            print("final loss", final_loss.item())
+        dist.barrier()
+    train_bar.close()
+
+    # PPO health diagnostics over this step's inner loop (clip_range == 1e-4)
+    if len(ppo_ratios) > 0:
+        ratios_cat = torch.cat(ppo_ratios).float()
+        deltas_cat = torch.cat(ppo_deltas).float()
+        metrics["approx_kl"] = (0.5 * (deltas_cat ** 2).mean()).item()
+        metrics["clipfrac"] = ((ratios_cat - 1.0).abs() > 1e-4).float().mean().item()
+        metrics["ratio_mean"] = ratios_cat.mean().item()
+        metrics["ratio_std"] = ratios_cat.std().item()
+        metrics["ratio_max"] = ratios_cat.max().item()
+        metrics["ratio_min"] = ratios_cat.min().item()
+        if dist.get_rank() == 0:
+            print(
+                f"[clipfrac debug] step {step} clipfrac {metrics['clipfrac']:.4f} "
+                f"approx_kl {metrics['approx_kl']:.3e} "
+                f"ratio mean/std {metrics['ratio_mean']:.6f}/{metrics['ratio_std']:.3e} "
+                f"min/max {metrics['ratio_min']:.6f}/{metrics['ratio_max']:.6f}"
+            )
+
+    return total_loss, grad_norm.item(), metrics
+
+def main(args):
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(local_rank)
+    device = torch.cuda.current_device()
+    initialize_sequence_parallel_state(args.sp_size)
+
+    # If passed along, set the training seed now. On GPU...
+    if args.seed is not None:
+        # TODO: t within the same seq parallel group should be the same. Noise should be different.
+        set_seed(args.seed)
+    # We use different seeds for the noise generation in each process to ensure that the noise is different in a batch.
+
+    # Handle the repository creation
+    if rank <= 0 and args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    # For mixed precision training we cast all non-trainable weigths to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    inferencer = None
+    if args.use_videoalign:
+        from fastvideo.models.videoalign.inference import VideoVLMRewardInference
+        load_from_pretrained = "./videoalign_ckpt"
+        dtype = torch.bfloat16
+        inferencer = VideoVLMRewardInference(load_from_pretrained, device=f'cuda:{device}', dtype=dtype)
+
+    #reward_model = 
+    main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
+    # keep the master weight to float32
+    
+    main_print(f"--> loading model from {args.model_type}")
+    
+    transformer = load_transformer(
+        args.model_type,
+        args.dit_model_name_or_path,
+        args.pretrained_model_name_or_path,
+        torch.float32 if args.master_weight_type == "fp32" else torch.bfloat16,
+    )
+
+    main_print(
+        f"  Total training parameters = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e6} M"
+    )
+    main_print(
+        f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
+    )
+    fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
+        transformer,
+        args.fsdp_sharding_startegy,
+        False,
+        args.use_cpu_offload,
+        args.master_weight_type,
+    )
+    transformer = FSDP(transformer, **fsdp_kwargs,)
+    #reference_transformer = load_reference_model(args)
+    main_print(f"--> model loaded")
+
+    if args.gradient_checkpointing:
+        apply_fsdp_checkpointing(
+            transformer, no_split_modules, args.selective_checkpointing
+        )
+
+    # Set model as trainable.
+    transformer.train()
+
+    params_to_optimize = transformer.parameters()
+    params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
+
+    optimizer = torch.optim.AdamW(
+        params_to_optimize,
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
+        eps=1e-8,
+    )
+
+    init_steps = 0
+    main_print(f"optimizer: {optimizer}")
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=1000000,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+        last_epoch=init_steps - 1,
+    )
+
+    train_dataset = LatentDataset(args.data_json_path, args.t, args.cfg)
+    sampler = DistributedSampler(
+            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
+        )
+    
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=sampler,
+        collate_fn=latent_collate_function,
+        pin_memory=True,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+    )
+
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader)
+        / args.gradient_accumulation_steps
+        * args.sp_size
+        / args.train_sp_batch_size
+    )
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    vae, autocast_type, fps = load_vae(args.model_type, args.vae_model_path)
+    #vae.enable_tiling()
+
+    if rank <= 0:
+        project = args.tracker_project_name or "fastvideo"
+        wandb.init(project=project, name=args.wandb_run_name, config=args)
+
+    # Train!
+    total_batch_size = (
+        world_size
+        * args.gradient_accumulation_steps
+        / args.sp_size
+        * args.train_sp_batch_size
+    )
+    main_print("***** Running training *****")
+    main_print(f"  Num examples = {len(train_dataset)}")
+    main_print(f"  Dataloader size = {len(train_dataloader)}")
+    main_print(f"  Resume training from step {init_steps}")
+    main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    main_print(
+        f"  Total train batch size (w. data & sequence parallel, accumulation) = {total_batch_size}"
+    )
+    main_print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    main_print(f"  Total optimization steps per epoch = {args.max_train_steps}")
+    main_print(
+        f"  Total training parameters per FSDP shard = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e9} B"
+    )
+    # print dtype
+    main_print(f"  Master weight dtype: {transformer.parameters().__next__().dtype}")
+
+    # full run configuration (rank 0 only) so every run's log records exactly what it ran with
+    main_print("***** Run configuration *****")
+    for k in sorted(vars(args)):
+        main_print(f"  {k} = {getattr(args, k)}")
+    main_print("*****************************")
+
+    progress_bar = tqdm(
+        range(0, 100000),
+        initial=init_steps,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=local_rank > 0,
+    )
+
+    loader = sp_parallel_dataloader_wrapper(
+        train_dataloader,
+        device,
+        args.train_batch_size,
+        args.sp_size,
+        args.train_sp_batch_size,
+    )
+
+    step_times = deque(maxlen=100)
+
+    # todo future
+    for epoch in range(1):
+        if isinstance(sampler, DistributedSampler):
+            sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch
+
+        for step in range(init_steps+1, args.max_train_steps+1):
+            start_time = time.time()
+            if step % args.checkpointing_steps == 0:
+                save_checkpoint(transformer, rank, args.output_dir,
+                                step, epoch)
+                dist.barrier()
+            loss, grad_norm, metrics = train_one_step(
+                args,
+                device, 
+                transformer,
+                vae,
+                inferencer,
+                optimizer,
+                lr_scheduler,
+                loader,
+                args.max_grad_norm,
+                step,
+            )
+    
+            step_time = time.time() - start_time
+            step_times.append(step_time)
+            avg_step_time = sum(step_times) / len(step_times)
+    
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss:.4f}",
+                    "step_time": f"{step_time:.2f}s",
+                    "grad_norm": grad_norm,
+                }
+            )
+            progress_bar.update(1)
+            if rank <= 0:
+                wandb.log(
+                    {
+                        "train_loss": loss,
+                        "learning_rate": lr_scheduler.get_last_lr()[0],
+                        "step_time": step_time,
+                        "avg_step_time": avg_step_time,
+                        "grad_norm": grad_norm,
+                        **metrics,
+                    },
+                    step=step,
+                )
+
+
+
+    if get_sequence_parallel_state():
+        destroy_sequence_parallel_group()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model_type", type=str, default="hunyuan_hf", help="The type of model to train."
+    )
+    # dataset & dataloader
+    parser.add_argument("--data_json_path", type=str, required=True)
+    parser.add_argument("--num_frames", type=int, default=163)
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=10,
+        help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+    )
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=16,
+        help="Batch size (per device) for the training dataloader.",
+    )
+    parser.add_argument("--group_frame", action="store_true")  # TODO
+    parser.add_argument("--group_resolution", action="store_true")  # TODO
+
+    # text encoder & vae & diffusion model
+    parser.add_argument("--pretrained_model_name_or_path", type=str)
+    parser.add_argument("--dit_model_name_or_path", type=str, default=None)
+    parser.add_argument("--vae_model_path", type=str, default=None, help="vae model.")
+    parser.add_argument("--cache_dir", type=str, default="./cache_dir")
+
+    # diffusion setting
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--ema_start_step", type=int, default=0)
+    parser.add_argument("--cfg", type=float, default=0.1)
+    parser.add_argument(
+        "--precondition_outputs",
+        action="store_true",
+        help="Whether to precondition the outputs of the model.",
+    )
+
+    # validation & logs
+    parser.add_argument("--validation_prompt_dir", type=str)
+    parser.add_argument("--uncond_prompt_dir", type=str)
+    parser.add_argument(
+        "--validation_sampling_steps",
+        type=str,
+        default="64",
+        help="use ',' to split multi sampling steps",
+    )
+    parser.add_argument(
+        "--validation_guidance_scale",
+        type=str,
+        default="4.5",
+        help="use ',' to split multi scale",
+    )
+    parser.add_argument("--validation_steps", type=int, default=50)
+    parser.add_argument("--log_validation", action="store_true")
+    parser.add_argument("--tracker_project_name", type=str, default=None)
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Name for the wandb run (the title shown in the wandb UI). "
+        "If None, wandb auto-generates a random run name.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="A seed for reproducible training."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help=("Max number of checkpoints to store."),
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
+            " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        "--resume_from_lora_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous lora checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help=(
+            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+        ),
+    )
+
+    # optimizer & scheduler & Training
+    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--scale_lr",
+        action="store_true",
+        default=False,
+        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
+    )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=10,
+        help="Number of steps for the warmup in the lr scheduler.",
+    )
+    parser.add_argument(
+        "--max_grad_norm", default=2.0, type=float, help="Max gradient norm."
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument("--selective_checkpointing", type=float, default=1.0)
+    parser.add_argument(
+        "--allow_tf32",
+        action="store_true",
+        help=(
+            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
+            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
+        ),
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
+            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+        ),
+    )
+    parser.add_argument(
+        "--use_cpu_offload",
+        action="store_true",
+        help="Whether to use CPU offload for param & gradient & optimizer states.",
+    )
+
+    parser.add_argument("--sp_size", type=int, default=1, help="For sequence parallel")
+    parser.add_argument(
+        "--train_sp_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for sequence parallel training",
+    )
+    parser.add_argument("--fsdp_sharding_startegy", default="full")
+    # lr_scheduler
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant_with_warmup",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_num_cycles",
+        type=int,
+        default=1,
+        help="Number of cycles in the learning rate scheduler.",
+    )
+    parser.add_argument(
+        "--lr_power",
+        type=float,
+        default=1.0,
+        help="Power factor of the polynomial scheduler.",
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.01, help="Weight decay to apply."
+    )
+    parser.add_argument(
+        "--master_weight_type",
+        type=str,
+        default="fp32",
+        help="Weight type to use - fp32 or bf16.",
+    )
+    parser.add_argument(
+        "--h",
+        type=int,
+        default=None,   
+        help="video height",
+    )
+    parser.add_argument(
+        "--w",
+        type=int,
+        default=None,   
+        help="video width",
+    )
+    parser.add_argument(
+        "--t",
+        type=int,
+        default=None,   
+        help="video length",
+    )
+    parser.add_argument(
+        "--sampling_steps",
+        type=int,
+        default=None,   
+        help="sampling steps",
+    )
+    parser.add_argument(
+        "--eta",
+        type=float,
+        default=None,
+        help="noise eta",
+    )
+    parser.add_argument(
+        "--sde_type",
+        type=str,
+        default="sde",
+        choices=["sde", "cps"],
+        help="stochastic sampler used by flux_step: 'sde' (score-based) or 'cps'",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,   
+        help="fps of stored video",
+    )
+    parser.add_argument(
+        "--sampler_seed",
+        type=int,
+        default=None,   
+        help="seed of sampler",
+    )
+    parser.add_argument(
+        "--use_group",
+        action="store_true",
+        default=False,
+        help="whether to use group",
+    )
+    parser.add_argument(
+        "--num_generations",
+        type=int,
+        default=16,
+        help="num_generations per prompt",
+    )
+    parser.add_argument(
+        "--sample_batch_size",
+        type=int,
+        default=1,
+        help="rollout sampling micro-batch: number of videos denoised in parallel per "
+        "forward pass. 1 = original sequential behavior. Larger uses more GPU memory "
+        "and speeds up the rollout. Must divide train_sp_batch_size*num_generations; "
+        "keep it a divisor of num_generations.",
+    )
+    parser.add_argument(
+        "--decode_batch_size",
+        type=int,
+        default=1,
+        help="how many videos to VAE-decode at once. The HunyuanVideo VAE does not tile "
+        "over the batch dim, so a large batched decode overflows upsample_nearest3d's "
+        "INT_MAX 32-bit indexing. 1 (per-video) is always safe; raise only if it fits "
+        "(at 480x480x53f, <=7 stays under INT_MAX). Independent of sample_batch_size.",
+    )
+    parser.add_argument(
+        "--train_micro_batch_size",
+        type=int,
+        default=1,
+        help="training micro-batch: number of selected samples processed per "
+        "forward+backward in the gradient phase. 1 = original per-sample behavior. "
+        "Must divide both gradient_accumulation_steps and the per-GPU selected-sample "
+        "count (n_groups*bestofn). The optimizer update is identical to m=1 (modulo FP).",
+    )
+    parser.add_argument(
+        "--use_same_noise",
+        action="store_true",
+        default=False,
+        help="whether to use same noise",
+    )
+    parser.add_argument(
+        "--use_videoalign",
+        action="store_true",
+        default=False,
+        help="whether to videoalign reward model",
+    )
+    parser.add_argument(
+        "--timestep_fraction",
+        type = float,
+        default=1.0,
+        help="timestep_fraction",
+    )
+    parser.add_argument(
+        "--shift",
+        type = float,
+        default=1.0,
+        help="shift value",
+    )
+    parser.add_argument(
+        "--bestofn",
+        type = int,
+        default=8,
+        help="the chosen samples in best-of-n",
+    )
+    parser.add_argument(
+        "--vq_coef",
+        type=float,
+        default=1.0,   
+        help="vq coef",
+    )
+    parser.add_argument(
+        "--mq_coef",
+        type=float,
+        default=0.0,
+        help="mq coef",
+    )
+    parser.add_argument(
+        "--ta_coef",
+        type=float,
+        default=0.0,
+        help="ta (text alignment) coef",
+    )
+
+    args = parser.parse_args()
+    main(args)
